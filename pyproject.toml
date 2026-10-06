@@ -1,0 +1,18 @@
+[project]
+name = "glkvm-mcp"
+version = "0.1.0"
+description = "MCP server for the GLKVM KVM session: accurate mouse, complete keyboard, OCR element tree, human-interference detection"
+license = "AGPL-3.0-or-later"
+requires-python = ">=3.12"
+dependencies = [
+    "fastmcp>=4.0",
+    "websockets>=15",
+    "httpx>=0.28",
+    "pillow>=11",
+    "numpy>=2",
+    "opencv-python-headless>=4.10",
+    "rapidocr-onnxruntime>=1.4",
+]
+
+[tool.uv]
+package = false
