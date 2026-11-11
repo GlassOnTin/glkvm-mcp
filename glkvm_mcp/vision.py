@@ -119,14 +119,29 @@ def quad_to_bbox(quad: list[list[float]]) -> tuple[float, float, float, float]:
     return (min(xs), min(ys), max(xs), max(ys))
 
 
-def build_tree(res: list, w: int, h: int, sha: str, ts: float, ocr_ms: float,
-               letters: bool = False, min_score: float = 0.45) -> dict:
-    """OCR results -> blocks/lines/words(/letters) tree with screen-px bboxes."""
+def build_tree(
+    res: list,
+    w: int,
+    h: int,
+    sha: str,
+    ts: float,
+    ocr_ms: float,
+    letters: bool = False,
+    min_score: float = 0.45,
+    offset_x: int = 0,
+    offset_y: int = 0,
+    region: list[int] | None = None,
+) -> dict:
+    """OCR results -> blocks/lines/words(/letters) tree with full-screen-px bboxes."""
     lines = []
-    for i, (quad, text, score) in enumerate(res):
+    for quad, text, score in res:
         if score < min_score or not text.strip():
             continue
         x0, y0, x1, y1 = quad_to_bbox(quad)
+        x0 += offset_x
+        x1 += offset_x
+        y0 += offset_y
+        y1 += offset_y
         lines.append({
             "i": len(lines),
             "text": text,
@@ -170,7 +185,7 @@ def build_tree(res: list, w: int, h: int, sha: str, ts: float, ocr_ms: float,
                 wnode = {
                     "id": f"b{bi}l{li}w{wi}",
                     "text": line["text"][s:e],
-                    "bbox": [round(wx0), round(wy0), round(wx1 - wx0), round(wy1 - wy0)],
+                    "bbox": [round(wx0), round(wy0), round(wx1 - wx0), round(wy1 - y0)],
                 }
                 if letters and (e - s) <= 18:
                     chars = []
@@ -201,10 +216,95 @@ def build_tree(res: list, w: int, h: int, sha: str, ts: float, ocr_ms: float,
                 ln["words"] = words
             bl["lines"].append(ln)
         out_blocks.append(bl)
+    frame_meta: dict[str, Any] = {
+        "w": w,
+        "h": h,
+        "sha12": sha,
+        "ocr_ts": round(ts, 3),
+        "ocr_ms": round(ocr_ms, 1),
+    }
+    if region is not None:
+        frame_meta["region"] = region
     return {
-        "frame": {"w": w, "h": h, "sha12": sha, "ocr_ts": round(ts, 3), "ocr_ms": round(ocr_ms, 1)},
+        "frame": frame_meta,
         "counts": {"blocks": len(out_blocks), "lines": sum(len(b["lines"]) for b in out_blocks)},
         "blocks": out_blocks,
+    }
+
+
+def extract_lines(tree: dict) -> list[dict]:
+    """Compact line list [{id, text, score, bbox, center}] without per-word expansion."""
+    out: list[dict] = []
+    for b in tree.get("blocks", []):
+        for l in b.get("lines", []):
+            bx0, by0, bw, bh = l["bbox"]
+            out.append({
+                "id": l["id"],
+                "text": l["text"],
+                "score": l["score"],
+                "bbox": l["bbox"],
+                "center": [round(bx0 + bw / 2), round(by0 + bh / 2)],
+            })
+    return out
+
+
+def extract_text_rows(tree: dict) -> list[str]:
+    """Row-merged plain text lines sorted top-to-bottom, left-to-right."""
+    raw = extract_lines(tree)
+    if not raw:
+        return []
+    raw.sort(key=lambda l: (l["center"][1], l["bbox"][0]))
+    rows: list[list[dict]] = []
+    for ln in raw:
+        if rows:
+            prev = rows[-1][-1]
+            max_h = max(prev["bbox"][3], ln["bbox"][3], 12)
+            if abs(ln["center"][1] - prev["center"][1]) <= 0.55 * max_h:
+                rows[-1].append(ln)
+                continue
+        rows.append([ln])
+    merged: list[str] = []
+    for r in rows:
+        r.sort(key=lambda l: l["bbox"][0])
+        merged.append("  ".join(seg["text"] for seg in r))
+    return merged
+
+
+def diff_lines(
+    prev_lines: list[dict] | None,
+    curr_lines: list[dict],
+    max_dist: float = 64.0,
+) -> dict:
+    """Compute added/removed lines relative to prev_lines using normalized text + proximity."""
+    prev = prev_lines or []
+    used = [False] * len(prev)
+    added: list[dict] = []
+    unchanged = 0
+    for c in curr_lines:
+        cn = _norm(c["text"])
+        cx, cy = c["center"]
+        best_idx = -1
+        best_dist = float("inf")
+        for pi, p in enumerate(prev):
+            if used[pi] or _norm(p["text"]) != cn:
+                continue
+            px, py = p["center"]
+            d = float(np.hypot(cx - px, cy - py))
+            if d <= max_dist and d < best_dist:
+                best_dist = d
+                best_idx = pi
+        if best_idx >= 0:
+            used[best_idx] = True
+            unchanged += 1
+        else:
+            added.append(c)
+    removed = [p for idx, p in enumerate(prev) if not used[idx]]
+    return {
+        "has_baseline": prev_lines is not None,
+        "changed": bool(added or removed),
+        "unchanged_line_count": unchanged,
+        "added_lines": added,
+        "removed_lines": removed,
     }
 
 
@@ -225,19 +325,62 @@ def flatten(tree: dict) -> list[dict]:
     return nodes
 
 
-def find_text(tree: dict, query: str, nth: int = 0, exact: bool = False) -> list[dict]:
-    q = query.casefold().strip()
+def find_text(
+    tree: dict,
+    query: str,
+    nth: int = 0,
+    exact: bool = False,
+    near: list[int] | None = None,
+) -> list[dict]:
+    q = _norm(query) if exact else query.casefold().strip()
     nodes = flatten(tree)
     matches = []
     for n in nodes:
-        t = n["text"].casefold().strip()
+        t = _norm(n["text"]) if exact else n["text"].casefold().strip()
         if (exact and t == q) or (not exact and q in t):
             matches.append(n)
-    # prefer word-level hits and earlier screen position
-    matches.sort(key=lambda m: (m["level"] != "word", m["center"][1], m["center"][0]))
+    if near and len(near) == 2:
+        nx, ny = near
+        matches.sort(
+            key=lambda m: (
+                float(np.hypot(m["center"][0] - nx, m["center"][1] - ny)),
+                m["level"] != "word",
+            )
+        )
+    else:
+        # prefer word-level hits and earlier screen position
+        matches.sort(key=lambda m: (m["level"] != "word", m["center"][1], m["center"][0]))
     if nth < 0:
         return matches[nth:] if nth == -1 else matches
     return matches[nth:]
+
+
+def anchor_point(
+    bbox: list[int],
+    anchor: str = "center",
+    dx: int = 0,
+    dy: int = 0,
+    frame_w: int | None = None,
+    frame_h: int | None = None,
+) -> tuple[int, int]:
+    x, y, w, h = bbox
+    a = (anchor or "center").strip().lower()
+    if a == "left":
+        bx, by = x, round(y + h / 2)
+    elif a == "right":
+        bx, by = x + w, round(y + h / 2)
+    elif a == "top":
+        bx, by = round(x + w / 2), y
+    elif a == "bottom":
+        bx, by = round(x + w / 2), y + h
+    else:
+        bx, by = round(x + w / 2), round(y + h / 2)
+    cx, cy = bx + dx, by + dy
+    if frame_w is not None and frame_w > 0:
+        cx = max(0, min(frame_w - 1, cx))
+    if frame_h is not None and frame_h > 0:
+        cy = max(0, min(frame_h - 1, cy))
+    return (cx, cy)
 
 
 def crop_for(img, node: dict, pad: int = 24):

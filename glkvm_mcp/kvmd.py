@@ -9,13 +9,20 @@
 #   keyboard POST /api/hid/events/send_key?key=KeyA&state=1|0        KeyboardEvent.code names
 #            POST /api/hid/print                                     body=utf-8 text, server-side keysym typing
 #            POST /api/hid/events/send_shortcut?keys=MetaLeft,KeyE   press-all, release-reverse
+#            typing: /api/hid/print assumes a US target layout; on UK targets
+#            it mangles text (" -> @, \ -> #) and ignores a layout= query
+#            param. So text is typed client-side from a layout table
+#            (see _LAYOUTS) via send_key; only unmapped chars use /api/hid/print.
 #   video    GET  /streamer/snapshot                                 live JPEG of target display
 #   state    GET  /api/hid, GET /api/hid/inactivity
 #
-# Absolute-mouse calibration at 2560x1440 (measured, +-1px):
-#   x_px = 0.05*W + 0.90*W*(v_x+32768)/65535   (GL firmware maps only the middle 90% width)
-#   y_px = 1.00*H*(v_y+32768)/65535            (full height)
-#   inverse: v_x = (x_px-0.05*W)*65535/(0.90*W)-32768 ; v_y = y_px*65535/H-32768
+# Absolute-mouse calibration (measured, +-1px):
+#   The USB HID digitizer spans [-32768..32767] across the target's active desktop.
+#   On a native 16:9 target, active_left_px = 0 and active_width_px = W.
+#   When a 16:10 laptop panel (e.g. 1920x1200 or 2304x1440) is mirrored inside a
+#   16:9 HDMI signal (1920x1080 or 2560x1440), symmetric pillarbox bars appear on
+#   each side (e.g. 96px left/right -> active_width_px = 1728 = 0.90*W), and the OS
+#   maps [-32768..32767] across [active_left_px, active_left_px + active_width_px].
 
 from __future__ import annotations
 
@@ -35,24 +42,148 @@ HOST = os.environ.get("GLKVM_HOST", "glkvm.lan")
 USER = os.environ.get("GLKVM_USER", "admin")
 PASSWORD = os.environ.get("GLKVM_PASSWORD", "")
 BASE = os.environ.get("GLKVM_BASE", f"https://{HOST}")
+# Target machine's OS keyboard layout, used to synthesise text correctly:
+# /api/hid/print assumes US and mangles text on UK targets.
+LAYOUT = os.environ.get("GLKVM_KEYBOARD_LAYOUT", "uk").lower()
 
 _TOKEN_FILE = os.path.expanduser(f"~/.cache/glkvm-mcp/{HOST}.token.json")
 
-# Empirical GL absolute-mouse mapping constants (fractions of frame size).
-_X_OFF_FRAC = 0.05
-_X_SPAN_FRAC = 0.90
+# Studio/limited-range HDMI black (BT.709 YCbCr 16..235 -> RGB ~16) + 4:2:0 JPEG ringing tolerance.
+PILLARBOX_BLACK_MAX = 22
+PILLARBOX_CHROMA_SPREAD_MAX = 8
+
+# -- target-layout tables ---------------------------------------------------
+# /api/hid/print does server-side keysym printing with a US layout baked
+# in; GL firmware 4.82 accepts a layout= query param but ignores it. So we
+# synthesise keys ourselves: send_key carries position codes (KeyboardEvent
+# .code), and the target OS applies ITS layout to them.
+#
+# GL kvmd also knows the ISO 102nd key as "IntlBackslash"; on a UK Windows
+# target one press types a real "\" (verified live) and shift+press "|", so
+# the uk table covers \ and | through it.
+
+_LETTERS = {
+    **{chr(ord("a") + i): (f"Key{chr(ord('A') + i)}", False) for i in range(26)},
+    **{chr(ord("A") + i): (f"Key{chr(ord('A') + i)}", True) for i in range(26)},
+}
+
+_UK_PUNCT = {
+    " ": ("Space", False), "\t": ("Tab", False), "\n": ("Enter", False),
+    "1": ("Digit1", False), "!": ("Digit1", True),
+    "2": ("Digit2", False), '"': ("Digit2", True),
+    "3": ("Digit3", False),   # UK shifted 3 is £ (non-ASCII, printer path)
+    "4": ("Digit4", False), "$": ("Digit4", True),
+    "5": ("Digit5", False), "%": ("Digit5", True),
+    "6": ("Digit6", False), "^": ("Digit6", True),
+    "7": ("Digit7", False), "&": ("Digit7", True),
+    "8": ("Digit8", False), "*": ("Digit8", True),
+    "9": ("Digit9", False), "(": ("Digit9", True),
+    "0": ("Digit0", False), ")": ("Digit0", True),
+    "-": ("Minus", False), "_": ("Minus", True),
+    "=": ("Equal", False), "+": ("Equal", True),
+    "[": ("BracketLeft", False), "{": ("BracketLeft", True),
+    "]": ("BracketRight", False), "}": ("BracketRight", True),
+    ";": ("Semicolon", False), ":": ("Semicolon", True),
+    "'": ("Quote", False), "@": ("Quote", True),
+    # UK: the ANSI backslash position carries # and ~
+    "#": ("Backslash", False), "~": ("Backslash", True),
+    # ISO 102nd key: UK Windows maps it to \ (shift: |)
+    "\\": ("IntlBackslash", False), "|": ("IntlBackslash", True),
+    ",": ("Comma", False), "<": ("Comma", True),
+    ".": ("Period", False), ">": ("Period", True),
+    "/": ("Slash", False), "?": ("Slash", True),
+    "`": ("Backquote", False),   # UK shifted is ¬ (non-ASCII)
+}
+
+_US_PUNCT = {
+    " ": ("Space", False), "\t": ("Tab", False), "\n": ("Enter", False),
+    "1": ("Digit1", False), "!": ("Digit1", True),
+    "2": ("Digit2", False), "@": ("Digit2", True),
+    "3": ("Digit3", False), "#": ("Digit3", True),
+    "4": ("Digit4", False), "$": ("Digit4", True),
+    "5": ("Digit5", False), "%": ("Digit5", True),
+    "6": ("Digit6", False), "^": ("Digit6", True),
+    "7": ("Digit7", False), "&": ("Digit7", True),
+    "8": ("Digit8", False), "*": ("Digit8", True),
+    "9": ("Digit9", False), "(": ("Digit9", True),
+    "0": ("Digit0", False), ")": ("Digit0", True),
+    "-": ("Minus", False), "_": ("Minus", True),
+    "=": ("Equal", False), "+": ("Equal", True),
+    "[": ("BracketLeft", False), "{": ("BracketLeft", True),
+    "]": ("BracketRight", False), "}": ("BracketRight", True),
+    ";": ("Semicolon", False), ":": ("Semicolon", True),
+    "'": ("Quote", False), '"': ("Quote", True),
+    "\\": ("Backslash", False), "|": ("Backslash", True),
+    ",": ("Comma", False), "<": ("Comma", True),
+    ".": ("Period", False), ">": ("Period", True),
+    "/": ("Slash", False), "?": ("Slash", True),
+    "`": ("Backquote", False), "~": ("Backquote", True),
+}
+
+_LAYOUTS = {
+    "uk": {**_LETTERS, **_UK_PUNCT},
+    "us": {**_LETTERS, **_US_PUNCT},
+}
 
 
-def v_from_px_x(x: float, w: int) -> int:
-    return max(-32768, min(32767, round((x - _X_OFF_FRAC * w) * 65535 / (_X_SPAN_FRAC * w)) - 32768))
+def detect_horizontal_pillarbox(img: PILImage.Image) -> tuple[int, int]:
+    """Detect symmetric horizontal pillarbox bars (e.g. 16:10 panel mirrored in 16:9 HDMI).
+
+    Returns (active_left_px, active_width_px). Returns (0, w) when no symmetric bars exist."""
+    import numpy as np
+
+    w, h = img.width, img.height
+    if w < 64 or h < 64:
+        return (0, max(0, w))
+    sample_ys = [min(h - 1, max(0, int((i + 0.5) * h / 16))) for i in range(16)]
+    rgb = img if img.mode == "RGB" else img.convert("RGB")
+    rows = np.asarray(rgb, dtype=np.int16)[sample_ys, :, :3]  # (16, w, 3)
+    max_ch = rows.max(axis=2)
+    min_ch = rows.min(axis=2)
+    col_black = ((max_ch <= PILLARBOX_BLACK_MAX) & ((max_ch - min_ch) <= PILLARBOX_CHROMA_SPREAD_MAX)).all(axis=0)
+
+    max_margin = int(w * 0.20)
+    left_bar = 0
+    while left_bar < max_margin and bool(col_black[left_bar]):
+        left_bar += 1
+    right_bar = 0
+    while right_bar < max_margin and bool(col_black[w - 1 - right_bar]):
+        right_bar += 1
+
+    min_margin = max(8, int(w * 0.02))
+    tolerance = max(6, int(w * 0.005))
+    if left_bar >= min_margin and right_bar >= min_margin and abs(left_bar - right_bar) <= tolerance:
+        margin = min(left_bar, right_bar)
+        active_w = w - 2 * margin
+        if active_w > w // 2:
+            return (margin, active_w)
+    return (0, w)
+
+
+def v_from_px_x(
+    x: float,
+    w: int,
+    active_left_px: int = 0,
+    active_width_px: int | None = None,
+) -> int:
+    span = max(1, active_width_px if active_width_px is not None else w)
+    return max(-32768, min(32767, round((x - active_left_px) * 65535 / span) - 32768))
 
 
 def v_from_px_y(y: float, h: int) -> int:
-    return max(-32768, min(32767, round(y * 65535 / h) - 32768))
+    return max(-32768, min(32767, round(y * 65535 / max(1, h)) - 32768))
 
 
-def px_from_v(vx: int, vy: int, w: int, h: int) -> tuple[float, float]:
-    x = _X_OFF_FRAC * w + _X_SPAN_FRAC * w * (vx + 32768) / 65535
+def px_from_v(
+    vx: int,
+    vy: int,
+    w: int,
+    h: int,
+    active_left_px: int = 0,
+    active_width_px: int | None = None,
+) -> tuple[float, float]:
+    span = max(1, active_width_px if active_width_px is not None else w)
+    x = active_left_px + span * (vx + 32768) / 65535
     y = h * (vy + 32768) / 65535
     return (x, y)
 
@@ -71,6 +202,10 @@ class GlkvmClient:
         self._login_lock = asyncio.Lock()
         self._w = 2560
         self._h = 1440
+        self._active_left_px = 0
+        self._active_width_px = 2560
+        self._geometry_initialized = False
+        self._inactivity_supported: bool | None = None
         self.last_input_ts = 0.0  # time of last HID event WE sent
         self._motion_ref: tuple[float, list[float]] | None = None
 
@@ -133,6 +268,7 @@ class GlkvmClient:
         query: dict[str, Any] | None = None,
         data: dict[str, Any] | None = None,
         raw_content: bytes | None = None,
+        files: dict[str, Any] | None = None,
         _retry: bool = True,
     ) -> httpx.Response:
         tok = await self.login()
@@ -144,18 +280,20 @@ class GlkvmClient:
             kw["data"] = data
         if raw_content is not None:
             kw["content"] = raw_content
+        if files is not None:
+            kw["files"] = files
         r = await http.request(method, path, params=q, headers={"token": tok}, **kw)
         if r.status_code == 401 and _retry:
             await self.login(force=True)
             return await self.request(method, path, query=query, data=data,
-                                      raw_content=raw_content, _retry=False)
+                                      raw_content=raw_content, files=files, _retry=False)
         if r.status_code == 403 and _retry and "ForbiddenError" in r.text:
             # GL fork: an unknown but format-valid token returns 403
             # ForbiddenError (kvmd restart invalidates the cached token;
             # genuinely denied permissions come back 401 or 400 instead).
             await self.login(force=True)
             return await self.request(method, path, query=query, data=data,
-                                      raw_content=raw_content, _retry=False)
+                                      raw_content=raw_content, files=files, _retry=False)
         if r.status_code >= 400:
             snippet = r.text[:200]
             raise GlkvmError(f"{method} {path} -> {r.status_code}: {snippet}")
@@ -203,19 +341,63 @@ class GlkvmClient:
             await self.key_up(k)
             await asyncio.sleep(0.02)
 
-    async def type_text(self, text: str, delay: float = 0.02) -> None:
-        """Unicode typing via kvmd's server-side keysym printer."""
+    async def type_text(self, text: str, delay: float = 0.004) -> None:
+        """Type text as real keystrokes using a target-layout table.
+
+        send_key carries position codes, so the target OS applies ITS keyboard
+        layout. Characters covered by the table are typed this way with ShiftLeft
+        coalesced across runs; anything else (accents, symbols) goes through the
+        kvmd keysym-printer, which assumes a US layout and may mangle those on
+        other targets. Layout selection: env GLKVM_KEYBOARD_LAYOUT (default "uk")."""
         if not text:
             return
-        chunks = [text[i:i + 900] for i in range(0, len(text), 900)]
-        for c in chunks:
-            await self.post_ok("/api/hid/print", query={"delay": delay}, raw_content=c.encode("utf-8"))
+        tbl = _LAYOUTS[LAYOUT]
+        runs: list[tuple[bool, str]] = []
+        buf, mapped = "", None
+        for ch in text:
+            if mapped is None or (ch in tbl) == mapped:
+                buf += ch
+                mapped = ch in tbl
+            else:
+                runs.append((mapped, buf))
+                buf, mapped = ch, ch in tbl
+        if buf:
+            runs.append((mapped, buf))
+        shift = "ShiftLeft"
+        shift_held = False
+        try:
+            for is_mapped, chunk in runs:
+                if not is_mapped:
+                    if shift_held:
+                        await self.key_up(shift)
+                        shift_held = False
+                    await self.post_ok("/api/hid/print", query={"delay": delay},
+                                       raw_content=chunk.encode("utf-8"))
+                    continue
+                for ch in chunk:
+                    code, sh = tbl[ch]
+                    if sh != shift_held:
+                        if sh:
+                            await self.key_down(shift)
+                        else:
+                            await self.key_up(shift)
+                        shift_held = sh
+                    await self.key_tap(code, hold_s=max(0.0, delay / 2))
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+        finally:
+            if shift_held:
+                try:
+                    await self.key_up(shift)
+                except Exception:
+                    pass
         self.last_input_ts = time.time()
 
     # -- mouse ---------------------------------------------------------------
 
     async def mouse_move(self, x: float, y: float) -> tuple[int, int]:
-        vx, vy = v_from_px_x(x, self._w), v_from_px_y(y, self._h)
+        vx = v_from_px_x(x, self._w, self._active_left_px, self._active_width_px)
+        vy = v_from_px_y(y, self._h)
         await self.post_ok("/api/hid/events/send_mouse_move",
                            query={"to_x": vx, "to_y": vy})
         self.last_input_ts = time.time()
@@ -333,18 +515,87 @@ class GlkvmClient:
         # note: GL fork's state listing may briefly keep showing the removed
         # image (state-cache race observed); re-check after ~1s if needed.
 
+    def _update_frame_geometry(self, img: PILImage.Image) -> None:
+        same_res = self._geometry_initialized and (img.width, img.height) == (self._w, self._h)
+        left, active_w = detect_horizontal_pillarbox(img)
+        if same_res and abs(left - self._active_left_px) <= 2 and abs(active_w - self._active_width_px) <= 4:
+            return
+        self._w, self._h = img.width, img.height
+        self._active_left_px = left
+        self._active_width_px = active_w
+        self._geometry_initialized = True
+
     async def snapshot(self) -> tuple[PILImage.Image, str]:
         r = await self.request("GET", "/streamer/snapshot")
         img = PILImage.open(io.BytesIO(r.content))
         img.load()
-        if (img.width, img.height) != (self._w, self._h):
-            self._w, self._h = img.width, img.height
+        self._update_frame_geometry(img)
         sha = hashlib.sha256(r.content).hexdigest()[:12]
         return (img, sha)
 
     @property
     def resolution(self) -> tuple[int, int]:
         return (self._w, self._h)
+
+    @property
+    def active_bounds(self) -> tuple[int, int]:
+        return (self._active_left_px, self._active_width_px)
+
+    # -- video state / EDID ---------------------------------------------------
+
+    async def video_state(self) -> dict:
+        """HDMI/capture state from the streamer API: signal, resolution, fps."""
+        j = await self.get_json("/api/streamer")
+        st = (j.get("result") or {}).get("streamer") or {} if isinstance(j, dict) else {}
+        src = st.get("source") or {}
+        return {
+            "signal": (st.get("hdmi") or {}).get("signal"),
+            "resolution": src.get("real_resolution"),
+            "fps": src.get("captured_fps"),
+        }
+
+    async def edid_get(self) -> str:
+        """Current configured EDID preset, e.g. "E2560x1440" ("" = device default)."""
+        j = await self.get_json("/api/upgrade/get_edid")
+        if isinstance(j, dict):
+            r = j.get("result")
+            r = r if isinstance(r, dict) else j
+            v = r.get("edid")
+            return v if isinstance(v, str) else ""
+        return ""
+
+    async def edid_set(self, value: str) -> dict:
+        """Re-apply an EDID preset (Settings > Device Identity > EDID in the GL
+        UI). POST /api/upgrade/edid as multipart form field "edid" - the browser
+        UI sends the same FormData. Returns the parsed JSON response."""
+        r = await self.request("POST", "/api/upgrade/edid", files={"edid": (None, value)})
+        try:
+            j = r.json()
+        except Exception:
+            j = {"status": r.status_code, "text": r.text[:200]}
+        return j
+
+    async def edid_prod(self, timeout_s: float = 15.0) -> dict:
+        """Re-emit the current EDID preset to pulse HPD and wake a target whose
+        GPU dropped its HDMI output (seen after KVM reboots: Windows still shows
+        'duplicate' on, but no signal reaches the KVM). Equivalent to flicking
+        the EDID setting in the GL web UI. Polls up to timeout_s for the signal
+        to return."""
+        before = await self.video_state()
+        cur = await self.edid_get()
+        value = cur or "E2560x1440"  # GL default preset for this model (RM10)
+        resp = await self.edid_set(value)
+        after = await self.video_state()
+        deadline = time.time() + timeout_s
+        polls = 0
+        while not after.get("signal") and time.time() < deadline:
+            await asyncio.sleep(2)
+            after = await self.video_state()
+            polls += 1
+        return {"ok": bool(after.get("signal")),
+                "edid": f"{value[:16]}.. ({len(value)} hex chars)",
+                "edid_reapplied_same_blob": cur == value,
+                "before": before, "after": after, "polls": polls, "response": resp}
 
     # -- state / activity --------------------------------------------------------
 
@@ -382,10 +633,13 @@ class GlkvmClient:
         frames changing while this tool was idle (quiet) imply an active person
         or another client on the target."""
         inact: float | None = None
-        try:
-            inact = await self.inactivity()
-        except Exception:
-            pass
+        if self._inactivity_supported is not False:
+            try:
+                inact = await self.inactivity()
+                self._inactivity_supported = True
+            except Exception as e:
+                if "404" in str(e):
+                    self._inactivity_supported = False
         quiet = time.time() - self.last_input_ts
         out: dict[str, Any] = {
             "hid_inactivity_s": round(inact, 1) if inact is not None and inact >= 0 else None,

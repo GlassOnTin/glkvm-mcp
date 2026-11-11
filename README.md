@@ -19,6 +19,7 @@ Built and verified against a GL.iNet RM10 running kvmd 4.82 (GL fork). Other GLK
 | `GLKVM_PASSWORD` | unset | Web UI password, required |
 | `GLKVM_BASE` | `https://<GLKVM_HOST>` | Full base URL override |
 | `GLKVM_ALLOW_MSD` | unset | Set to `1`/`true`/`yes` to enable the `msd_*` tools |
+| `GLKVM_KEYBOARD_LAYOUT` | `uk` | Target OS keyboard layout for `type_text` (`uk` or `us`) |
 
 Setup and registration in Claude Code (`.mcp.json`):
 
@@ -38,14 +39,17 @@ Setup and registration in Claude Code (`.mcp.json`):
 
 Screen:
 
-- `screenshot` - live frame as an image, content-sized to taste
-- `screen_elements` - OCR of the current frame into a JSON tree (blocks, lines, words, optional letters) with pixel bounding boxes
-- `snapshot_info` - display resolution and a frame hash to test freshness
+- `screenshot` - live frame (default `max_width=1920`, so 1080p frames stay 1:1 with click coordinates) plus structured resolution, scale, and active pillarbox bounds; optional `region=[x,y,w,h]` crop
+- `screen_elements` - OCR of the current frame in full-screen pixel coordinates; supports `mode="lines" | "text" | "find" | "diff" | "tree"`, `region=[x,y,w,h]` ROI cropping, and `include_image=False` to avoid redundant image transfers
+- `read_scrollable` - multi-step wheel-scroll + RapidOCR line deduplicator for reading terminal/TUI/browser scrollback without sending keystrokes (restores scroll position afterwards)
+- `snapshot_info` - display resolution, active non-pillarboxed horizontal bounds, and a frame hash to test freshness
+- `edid_prod` - re-apply the current EDID preset, which re-asserts EDID/HPD on the wire; wakes a target whose GPU dropped its HDMI output after a KVM reboot (`_snap()` does that once automatically across vision tools when it hits a no-signal error)
+- `video_state` - HDMI signal, resolution and capture fps, without grabbing a frame
 
-Input (coordinates are target-screen pixels):
+Input (coordinates are target-screen pixels; `click_at`, `click_text`, `scroll`, `key`, `key_combo`, and `type_text` accept `inspect_after="diff"|"lines"|"text"` and `return_screenshot=True` for single-round-trip action + observation):
 
 - `click_at`, `click_text`, `move_mouse`, `mouse_relative`, `drag`, `scroll`
-- `key`, `key_combo`, `type_text` - keys are KeyboardEvent.code names, so `MetaLeft` opens the target's Start menu; `type_text` sends arbitrary Unicode
+- `key`, `key_combo`, `type_text` - keys are KeyboardEvent.code names, so `MetaLeft` opens the target's Start menu; `type_text` types printable ASCII as real keystrokes using the target's own OS layout (`GLKVM_KEYBOARD_LAYOUT`, default `uk`, with `ShiftLeft` coalesced across shifted runs and optional `press_enter=True`), falling back to the kvmd keysym printer (US layout) for accented chars and other Unicode
 
 State and safety:
 
@@ -60,9 +64,9 @@ The `msd_*` tools use the KVM's emulated USB mass-storage drive: push wraps file
 
 ## Accuracy notes
 
-Absolute mouse mapping was measured at 1px error on 2560x1440 firmware. GL maps only the middle 90% of the screen width to the axis range; the constants live in `glkvm_mcp/kvmd.py` and are fractions of the frame size, so other resolutions need a re-measure. OCR boxes are pixel-accurate for line boxes, a few px for word boxes.
+Absolute mouse mapping uses the USB HID digitizer's `[-32768..32767]` range across the active target desktop (`[active_left_px, active_left_px + active_width_px]`). On a native 16:9 target `active_left_px = 0` and `active_width_px = width`; when a 16:10 laptop display is mirrored/pillarboxed inside a 16:9 HDMI capture frame (e.g. `1728x1080` centered inside `1920x1080` with 96px studio-black bars on each side), `snapshot()` detects the pillarbox bars automatically with 2px hysteresis. OCR boxes are pixel-accurate for line boxes, a few px for word boxes.
 
-Verified live: keyboard (keys, combos, Unicode typing over `/api/hid/print`), mouse absolute/relative/wheel/drag, caps-lock LED echo probe, snapshot, OCR tree, MSD push/pull byte-exact roundtrip. Not exercised live: `msd_connect`/`msd_disconnect` attach/detach (deliberately - it injects a USB-drive event into the session in use), horizontal wheel direction, and `human_activity` against a genuinely concurrent human operator.
+Verified live: keyboard (keys, combos, layout-aware typing on a UK Windows target, including `\`, `|`, `@`, `"`, `#`, `~`, and Unicode printing over `/api/hid/print`), mouse absolute/relative/wheel/drag, caps-lock LED echo probe, snapshot, OCR tree, MSD push/pull byte-exact roundtrip, `edid_prod` on a healthy HDMI signal (device replies "EDID data has been written and applied", capture fps dips for a few seconds, signal never drops). Not exercised live: `msd_connect`/`msd_disconnect` attach/detach (deliberately - it injects a USB-drive event into the session in use), horizontal wheel direction, `human_activity` against a genuinely concurrent human operator, and `edid_prod` recovering a genuinely no-signal target (first real drop will show it).
 
 ## License
 
